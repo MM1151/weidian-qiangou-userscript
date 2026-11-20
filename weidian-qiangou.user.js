@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微店抢购助手(准点结算 · 自动勾选 · 到收银台就停)
 // @namespace    https://github.com/companion/weidian-qiangou
-// @version      1.0.0
-// @description  微店定时开售商品:自动勾那一件 → 结算 → 刷新翻页 → 补勾「请选择」并点确定 → 点「提交订单」→ 跳到扫码页就停手,不碰付款。
+// @version      1.2.0
+// @description  微店定时开售商品:开售前 3~5 秒点结算进页 → 刷新翻页(页面一翻过来就停刷)→ 补勾「请选择」并点确定 → 点「提交订单」→ 跳到扫码页就停手,不碰付款。1.2.0:进页改卡 3~5 秒(原 25 秒);页面翻过来就停止刷新(不再把刚勾好的冲掉);没有必选项的商家靠「商品尚未开售」消失判翻页;提交前随机 0~0.5 秒;记「开售→收银台」耗时。
 // @author       companion
 // @match        https://weidian.com/*
 // @match        https://*.weidian.com/*
@@ -135,6 +135,20 @@
   let lastFill = 0;
   let lastRefresh = 0;
   let submitted = false;
+  // 2026-11-20:人类化 —— 刷新间隔不固定(1.8 秒上下乱飘,偶尔像网卡了多停一会儿)
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  let nextGap = 1.8;
+  function gapJitter() {
+    let g = 1.8 * rnd(0.7, 1.8);
+    if (Math.random() < 0.15) g += rnd(1.5, 4.0);
+    return g;
+  }
+  // 2026-11-21:开售前多少秒点「结算」进页 —— 默认 3~5 秒随机(真人盯秒数的样子),面板里填了就按填的来
+  let leadFixed = 0;
+  const leadSecs = () => (leadFixed > 0 ? leadFixed : rnd(3.0, 5.0));
+  // 页面「翻过来」之后就彻底不刷新了(刷新会把刚勾好的必选项冲掉)
+  let live = false;
+  let liveAt = 0;
 
   function setState(s) {
     const el = document.getElementById('wg-state');
@@ -146,7 +160,13 @@
     busy = true;
     try {
       if (onCashier()) {
-        if (cfg.armed) { setState('到了扫码页,停手'); cfg.armed = false; saveCfg(); }
+        if (cfg.armed) {
+          const dt = cfg.target ? (Date.now() / 1000 - cfg.target) : 0;
+          const word = cfg.target ? ('到扫码页了 · 开售→收银台 ' + dt.toFixed(2) + ' 秒') : '到了扫码页,停手';
+          setState(word);
+          console.log('[微店抢购]', word);
+          cfg.armed = false; saveCfg();
+        }
         return;
       }
       if (!cfg.armed) { return; }
@@ -154,8 +174,8 @@
       const left = cfg.target ? cfg.target - now : 0;
       setState(cfg.target ? ('盯住,还剩 ' + Math.max(0, Math.round(left)) + ' 秒') : '盯住(未定时)');
 
-      // 1. 购物车:开售前 25 秒摆好页面
-      if (onCart() && left > 0 && left < 26 && now - lastCart > 3) {
+      // 1. 购物车:开售前 3~5 秒(随机)才点结算进页 —— 页面越新越好,太早进去反而一直「库存不足」
+      if (onCart() && left > 0 && left < leadSecs() && now - lastCart > 1) {
         lastCart = now;
         const cb = itemCheckbox();
         if (cb) await clickSure(cb, () => true);
@@ -167,24 +187,48 @@
 
       // 2. 确认订单页
       if (onOrder()) {
+        // 还挂着「商品尚未开售 / 无法购买」= 还是开售前那张空壳页;这两句一没,说明真页面到了
+        const shell = /商品尚未开售|无法购买/.test(document.body.innerText || '');
+        if (!shell && !live) {
+          live = true; liveAt = now;
+          setState('页面翻过来了,不再刷新');
+          console.log('[微店抢购] 页面已翻篇 → 停止刷新(这店没有必选项也一样)');
+        }
         if (placeholder() || modalOption()) {
           if (now - lastFill > 0.8) {
             lastFill = now;
             const n = await fillOptions();
-            if (n > 0) console.log('[微店抢购] 勾了', n, '个必选项');
+            if (n > 0) {
+              live = true; liveAt = now;
+              console.log('[微店抢购] 勾了', n, '个必选项 → 之后不再刷新');
+            }
           }
           return;
         }
-        // 还没开售 → 靠刷新把这页翻过来
-        if (left > -240 && left < 8 && now - lastRefresh > 2.5) {
+        // 勾完了却还卡着 10 秒 → 放行最后再刷一次(兜底)
+        const sChk = submitBtn();
+        if (live && sChk && sChk.locked && now - liveAt > 10) {
+          live = false; liveAt = now;
+          console.log('[微店抢购] 勾完还卡着 10 秒 → 最后再刷一次试试');
+        }
+        // 还没开售 → 只在「开售前 60 秒 ~ 开售后 20 秒」里刷新翻页;页面翻过来就别再刷了(2026-11-21)
+        const s0 = submitBtn();
+        if (!live && left < 60 && left > -20 && (!s0 || s0.locked) && now - lastRefresh > nextGap) {
           lastRefresh = now;
-          const s = submitBtn();
-          if (!s || s.locked) { setState('刷新翻页…'); location.reload(); return; }
+          nextGap = gapJitter();
+          setState('刷新翻页…');
+          location.reload();
+          return;
         }
         const s = submitBtn();
         if (s && !s.locked && !submitted) {
           submitted = true;
-          setState('点「提交订单」!');
+          const wait = rnd(0, 0.5);          // 2026-11-21:人的手速有波动
+          setState('按钮放开,再等 ' + wait.toFixed(2) + ' 秒');
+          await sleep(wait * 1000);
+          const dt = cfg.target ? (Date.now() / 1000 - cfg.target) : 0;
+          setState('点「提交订单」! 开售+' + dt.toFixed(2) + ' 秒');
+          console.log('[微店抢购] 按钮放开: 开售+' + dt.toFixed(2) + ' 秒(等了 ' + wait.toFixed(2) + ' 秒)');
           once(s.el);
           for (let w = 0; w < 40; w++) {
             await sleep(150);
@@ -217,6 +261,7 @@
       '<button id="wg-read">读倒计时</button></div>',
       '<div class="wg-row"><button id="wg-arm">开始盯</button>',
       '<button id="wg-stop">停</button><span id="wg-left"></span></div>',
+      '<div class="wg-row">进页:开售前 <input id="wg-lead" size="2" placeholder="3-5"> 秒</div>',
       '<div class="wg-tip">停手点:跳到扫码页就结束,付款不动</div>'
     ].join('');
     const css = document.createElement('style');
@@ -259,6 +304,8 @@
         cfg.target = 0;
       }
       cfg.armed = true; submitted = false;
+      live = false; liveAt = 0;
+      leadFixed = parseFloat(String(document.getElementById('wg-lead').value || '').replace(/[^\d.]/g, '')) || 0;
       saveCfg();
       setState('开始了,去购物车那页等着');
     };
